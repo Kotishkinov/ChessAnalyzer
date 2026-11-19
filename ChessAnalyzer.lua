@@ -641,12 +641,16 @@ task.spawn(function()
 
         local current = readBoard()
         local placement = placementFrom(current)
+        local boardReady = true
 
         if placement == startPlacement and lastPlacement ~= startPlacement then
             castling = {K=true, Q=true, k=true, q=true}
             ep, halfmove, fullmove = "-", 0, 1
             setTurn("w")
+            previous = current
+            lastPlacement = placement
             lastFen = nil
+            clearArrow()
         elseif placement ~= lastPlacement then
             if oldFlip ~= boardFlipped then
                 -- A coordinate remap is not a chess move.
@@ -654,15 +658,22 @@ task.spawn(function()
                 lastPlacement = placement
                 lastFen = nil
             else
-                updateMetadata(previous, current)
-                previous = current
-                lastPlacement = placement
-                lastFen = nil
-                clearArrow()
+                local confirmedMove = updateMetadata(previous, current)
+                if confirmedMove then
+                    previous = current
+                    lastPlacement = placement
+                    lastFen = nil
+                    clearArrow()
+                else
+                    -- Keep the last complete board snapshot. The next poll can
+                    -- then recognize the full move after Roblox finishes animating.
+                    boardReady = false
+                    status.Text = "Syncing board animation..."
+                end
             end
         end
 
-        if enabled and not busy then
+        if enabled and not busy and boardReady then
             local fen = makeFen(current)
             if fen and (fen ~= lastFen or retryPending) and os.clock() >= nextApiRequestAt then
                 analyze()
