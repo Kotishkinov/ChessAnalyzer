@@ -25,7 +25,7 @@ local nextApiRequestAt = 0
 local retryPending = false
 local boardFlipped = false
 local playerSide = nil
-local turn = "w"
+local turn = nil
 local lastPlacement, lastFen = nil, nil
 local castling = {K=true, Q=true, k=true, q=true}
 local ep = "-"
@@ -88,8 +88,17 @@ local depthLabel = makeLabel("Depth: --", 104, 19)
 local engineLabel = makeLabel("Engine: Local Stockfish (waiting...)", 124, 18, 11)
 local toggle = makeButton("ENABLE ANALYSIS", 148, Color3.fromRGB(35, 135, 80))
 local autoButton = makeButton("AUTO MOVE: OFF", 184, Color3.fromRGB(65, 75, 95))
-local sideButton = makeButton("TURN: WHITE", 220, Color3.fromRGB(65, 85, 130))
+local turnLabel = makeLabel("TO MOVE: SYNCING...", 220, 20, 12)
 local playerSideLabel = makeLabel("YOU: DETECTING SIDE...", 256, 20, 12)
+
+local function setTurn(newTurn)
+    if newTurn ~= "w" and newTurn ~= "b" then return end
+    if turn ~= newTurn then
+        turn = newTurn
+        lastFen = nil
+    end
+    turnLabel.Text = newTurn == "w" and "TO MOVE: WHITE" or "TO MOVE: BLACK"
+end
 
 local overlay = Instance.new("Frame")
 overlay.Name = "ChessAnalyzerArrow"
@@ -234,49 +243,76 @@ local function placementFrom(squares)
 end
 
 local function updateMetadata(previous, current)
+    local sources, destinations = {}, {}
     ep = "-"
-    if not previous then return end
-    local fromIndex, toIndex, changed = nil, nil, {}
+
     for i = 1, 64 do
         if previous[i] ~= current[i] then
-            changed[#changed + 1] = i
-            if previous[i] ~= "." and current[i] == "." then fromIndex = i end
-            if current[i] ~= "." then toIndex = i end
+            if previous[i] ~= "." then sources[#sources + 1] = {index=i, piece=previous[i]} end
+            if current[i] ~= "." then
+                destinations[#destinations + 1] = {index=i, piece=current[i], captured=previous[i]}
+            end
         end
     end
-    if #changed < 2 then return end
+    if #sources == 0 or #destinations == 0 then return false end
 
-    local moved = fromIndex and previous[fromIndex] or nil
-    local captured = toIndex and previous[toIndex] or "."
-
-    if previous[61] == "K" and current[61] ~= "K" then castling.K, castling.Q = false, false end
-    if previous[5] == "k" and current[5] ~= "k" then castling.k, castling.q = false, false end
-    if previous[57] == "R" and current[57] ~= "R" then castling.Q = false end
-    if previous[64] == "R" and current[64] ~= "R" then castling.K = false end
-    if previous[1] == "r" and current[1] ~= "r" then castling.q = false end
-    if previous[8] == "r" and current[8] ~= "r" then castling.k = false end
-    if toIndex == 57 and captured == "r" then castling.Q = false end
-    if toIndex == 64 and captured == "r" then castling.K = false end
-    if toIndex == 1 and captured == "R" then castling.q = false end
-    if toIndex == 8 and captured == "R" then castling.k = false end
-
-    if moved == "P" and fromIndex and toIndex and math.abs(toIndex - fromIndex) == 16 then
-        local file = (fromIndex - 1) % 8
-        local targetRank = math.floor((fromIndex + toIndex) / 16)
-        ep = string.char(97 + file) .. tostring(8 - targetRank)
-    elseif moved == "p" and fromIndex and toIndex and math.abs(toIndex - fromIndex) == 16 then
-        local file = (fromIndex - 1) % 8
-        local targetRank = math.floor((fromIndex + toIndex) / 16)
-        ep = string.char(97 + file) .. tostring(8 - targetRank)
+    local function sideOf(piece)
+        if not piece or piece == "." then return nil end
+        return piece == piece:upper() and "w" or "b"
     end
 
-    if (moved and moved:lower() == "p") or captured ~= "." then halfmove = 0 else halfmove += 1 end
-    if turn == "b" then fullmove += 1 end
-    turn = turn == "w" and "b" or "w"
-    sideButton.Text = turn == "w" and "TURN: WHITE" or "TURN: BLACK"
+    local movedSide, chosen, ambiguous = nil, nil, false
+    for _, source in ipairs(sources) do
+        for _, destination in ipairs(destinations) do
+            local side = sideOf(source.piece)
+            local sameSide = side == sideOf(destination.piece)
+            local exact = source.piece == destination.piece
+            local promotion = source.piece:lower() == "p" and destination.piece:lower() ~= "p"
+            if sameSide and (exact or promotion) then
+                if movedSide and movedSide ~= side then ambiguous = true else movedSide = side end
+                local candidate = {from=source.index, to=destination.index, piece=source.piece}
+                if not chosen or source.piece:lower() == "k" or promotion then chosen = candidate end
+            end
+        end
+    end
+
+    -- Bulk board refreshes and incomplete animation frames are ignored.
+    if ambiguous or not movedSide or not chosen then return false end
+
+    local movedPiece, captured = chosen.piece, false
+    for _, source in ipairs(sources) do
+        local p, i = source.piece, source.index
+        if p == "K" and i == 61 then castling.K, castling.Q = false, false end
+        if p == "k" and i == 5 then castling.k, castling.q = false, false end
+        if p == "R" and i == 57 then castling.Q = false end
+        if p == "R" and i == 64 then castling.K = false end
+        if p == "r" and i == 1 then castling.q = false end
+        if p == "r" and i == 8 then castling.k = false end
+    end
+    for _, destination in ipairs(destinations) do
+        local oldPiece, i = destination.captured, destination.index
+        if oldPiece == "R" and i == 57 then castling.Q = false end
+        if oldPiece == "R" and i == 64 then castling.K = false end
+        if oldPiece == "r" and i == 1 then castling.q = false end
+        if oldPiece == "r" and i == 8 then castling.k = false end
+        if oldPiece ~= "." then captured = true end
+    end
+
+    if movedPiece:lower() == "p" and math.abs(chosen.to - chosen.from) == 16 then
+        local file = (chosen.from - 1) % 8
+        local middle = math.floor((chosen.from + chosen.to) / 2)
+        local rank = 8 - math.floor((middle - 1) / 8)
+        ep = string.char(97 + file) .. tostring(rank)
+    end
+    if movedPiece:lower() == "p" or captured then halfmove = 0 else halfmove += 1 end
+    if movedSide == "b" then fullmove += 1 end
+
+    setTurn(movedSide == "w" and "b" or "w")
+    return true
 end
 
 local function makeFen(squares)
+    if turn ~= "w" and turn ~= "b" then return nil end
     local rights = ""
     if castling.K then rights ..= "K" end
     if castling.Q then rights ..= "Q" end
@@ -285,6 +321,65 @@ local function makeFen(squares)
     if rights == "" then rights = "-" end
     return placementFrom(squares) .. " " .. turn .. " " .. rights .. " " .. ep .. " " .. halfmove .. " " .. fullmove
 end
+
+local function normalizeTurn(value, key)
+    if type(value) == "boolean" then
+        if key == "iswhiteturn" or key == "whitetomove" then return value and "w" or "b" end
+        if key == "isblackturn" or key == "blacktomove" then return value and "b" or "w" end
+    elseif type(value) == "string" then
+        local v = value:lower()
+        if v == "w" or v == "white" then return "w" end
+        if v == "b" or v == "black" then return "b" end
+    end
+    return nil
+end
+
+local function findTurnInState(value, depth)
+    if type(value) ~= "table" or depth > 5 then return nil end
+    local recognized = {
+        turn=true, currentturn=true, nextturn=true, sidetomove=true,
+        side_to_move=true, activecolor=true, activecolour=true,
+        turncolor=true, turncolour=true, iswhiteturn=true,
+        isblackturn=true, whitetomove=true, blacktomove=true
+    }
+    for key, child in pairs(value) do
+        local keyName = tostring(key):lower():gsub("[%s%-]", "")
+        if recognized[keyName] then
+            local parsed = normalizeTurn(child, keyName)
+            if parsed then return parsed end
+        end
+    end
+    for _, child in pairs(value) do
+        if type(child) == "table" then
+            local parsed = findTurnInState(child, depth + 1)
+            if parsed then return parsed end
+        end
+    end
+    return nil
+end
+
+local function attachTurnRemote()
+    local replicated = game:GetService("ReplicatedStorage")
+    local remotes = replicated:FindFirstChild("ChessRemotes")
+    local updateRemote = remotes and remotes:FindFirstChild("Update")
+    if updateRemote and updateRemote:IsA("RemoteEvent") then
+        updateRemote.OnClientEvent:Connect(function(...)
+            local args = {...}
+            if type(args[1]) == "string" and #args >= 2 then
+                local keyName = args[1]:lower():gsub("[%s%-]", "")
+                if keyName:find("turn") then
+                    local parsed = normalizeTurn(args[2], keyName)
+                    if parsed then setTurn(parsed) end
+                end
+            end
+            for _, value in ipairs(args) do
+                local parsed = findTurnInState(value, 0)
+                if parsed then setTurn(parsed); break end
+            end
+        end)
+    end
+end
+attachTurnRemote()
 
 local function boardPoint(square)
     local file = string.byte(square, 1) - 96
@@ -405,6 +500,11 @@ local function analyze()
     status.Text = "Status: LOCAL STOCKFISH..."
 
     local requestedFen = makeFen(readBoard())
+    if not requestedFen then
+        busy = false
+        status.Text = "Waiting for game turn sync..."
+        return
+    end
     local ok, result = pcall(function()
         local response = request({
             Url = LOCAL_STOCKFISH_URL,
@@ -415,7 +515,8 @@ local function analyze()
             },
             Body = HttpService:JSONEncode({
                 fen = requestedFen,
-                depth = LOCAL_STOCKFISH_DEPTH
+                depth = LOCAL_STOCKFISH_DEPTH,
+                movetime_ms = autoMoveEnabled and 550 or 800
             })
         })
 
@@ -487,13 +588,6 @@ toggle.MouseButton1Click:Connect(function()
     if not enabled then clearArrow() else lastPlacement = nil; lastFen = nil end
 end)
 
-sideButton.MouseButton1Click:Connect(function()
-    turn = turn == "w" and "b" or "w"
-    sideButton.Text = turn == "w" and "TURN: WHITE" or "TURN: BLACK"
-    lastFen = nil
-    clearArrow()
-end)
-
 autoButton.MouseButton1Click:Connect(function()
     autoMoveEnabled = not autoMoveEnabled
     autoButton.Text = autoMoveEnabled and "AUTO MOVE: ON" or "AUTO MOVE: OFF"
@@ -521,29 +615,59 @@ do
 end
 
 task.spawn(function()
+    -- Detect orientation before the first FEN snapshot.
+    detectPlayerSide()
     local previous = readBoard()
     lastPlacement = placementFrom(previous)
+    local startPlacement = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"
+
+    if lastPlacement == startPlacement then
+        castling = {K=true, Q=true, k=true, q=true}
+        ep, halfmove, fullmove = "-", 0, 1
+        setTurn("w")
+    else
+        turnLabel.Text = "TO MOVE: WAITING FOR SYNC"
+    end
+
     while gui.Parent do
-        task.wait(1.5)
+        task.wait(0.25)
+        local oldFlip = boardFlipped
         local detected = detectPlayerSide()
         if detected then
             playerSideLabel.Text = detected == "w" and "YOU: WHITE (AUTO)" or "YOU: BLACK (AUTO)"
         else
             playerSideLabel.Text = "YOU: SIDE NOT DETECTED"
         end
-        if enabled and not busy then
-            local current = readBoard()
-            local placement = placementFrom(current)
-            if placement ~= lastPlacement then
+
+        local current = readBoard()
+        local placement = placementFrom(current)
+
+        if placement == startPlacement and lastPlacement ~= startPlacement then
+            castling = {K=true, Q=true, k=true, q=true}
+            ep, halfmove, fullmove = "-", 0, 1
+            setTurn("w")
+            lastFen = nil
+        elseif placement ~= lastPlacement then
+            if oldFlip ~= boardFlipped then
+                -- A coordinate remap is not a chess move.
+                previous = current
+                lastPlacement = placement
+                lastFen = nil
+            else
                 updateMetadata(previous, current)
                 previous = current
                 lastPlacement = placement
                 lastFen = nil
                 clearArrow()
             end
+        end
+
+        if enabled and not busy then
             local fen = makeFen(current)
-            if (fen ~= lastFen or retryPending) and os.clock() >= nextApiRequestAt then
+            if fen and (fen ~= lastFen or retryPending) and os.clock() >= nextApiRequestAt then
                 analyze()
+            elseif not fen then
+                status.Text = "Waiting for turn sync..."
             end
         end
     end
