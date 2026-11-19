@@ -458,9 +458,41 @@ local function clickBoardSquare(square)
     vim:SendMouseButtonEvent(x, y, 0, false, game, 0)
 end
 
+local function moveIsOnBoard(uci)
+    local fromFile = string.byte(uci, 1) - 96
+    local fromRank = tonumber(uci:sub(2, 2))
+    local toFile = string.byte(uci, 3) - 96
+    local toRank = tonumber(uci:sub(4, 4))
+    if not fromRank or not toRank then return false end
+
+    local squares = readBoard()
+    local fromIndex = (8 - fromRank) * 8 + fromFile
+    local toIndex = (8 - toRank) * 8 + toFile
+    return squares[fromIndex] == "." and squares[toIndex] ~= "."
+end
+
 local function autoPlayMove(uci)
-    if not autoMoveEnabled or autoMoveBusy or not playerSide or turn ~= playerSide then return end
-    if type(uci) ~= "string" or #uci < 4 then return end
+    if not autoMoveEnabled then return end
+    if autoMoveBusy then
+        status.Text = "AUTO: another move is still running"
+        return
+    end
+    if not playerSide then
+        status.Text = "AUTO: waiting for player-side detection"
+        return
+    end
+    if not turn then
+        status.Text = "AUTO: waiting for turn sync"
+        return
+    end
+    if turn ~= playerSide then
+        status.Text = "AUTO: waiting for your turn"
+        return
+    end
+    if type(uci) ~= "string" or #uci < 4 then
+        status.Text = "AUTO: invalid move from engine"
+        return
+    end
     if #uci > 4 then
         status.Text = "AUTO: promotion requires manual choice"
         return
@@ -468,38 +500,83 @@ local function autoPlayMove(uci)
 
     local fromFile = string.byte(uci, 1) - 96
     local fromRank = tonumber(uci:sub(2, 2))
-    if fromFile < 1 or fromFile > 8 or not fromRank or fromRank < 1 or fromRank > 8 then return end
+    local toFile = string.byte(uci, 3) - 96
+    local toRank = tonumber(uci:sub(4, 4))
+    if fromFile < 1 or fromFile > 8 or toFile < 1 or toFile > 8
+        or not fromRank or fromRank < 1 or fromRank > 8
+        or not toRank or toRank < 1 or toRank > 8 then
+        status.Text = "AUTO: invalid UCI coordinates"
+        return
+    end
+
+    -- Do not click a move if the source square isn't occupied by our piece.
     local squares = readBoard()
-    local piece = squares[(8 - fromRank) * 8 + fromFile]
+    local fromIndex = (8 - fromRank) * 8 + fromFile
+    local piece = squares[fromIndex]
     if not piece or piece == "." then
-        status.Text = "AUTO: source square not found"
+        status.Text = "AUTO: source " .. uci:sub(1, 2) .. " is empty"
+        warn("[Chess Analyzer] Auto move cancelled: source square is empty")
         return
     end
     local pieceSide = piece == piece:upper() and "w" or "b"
     if pieceSide ~= playerSide then
-        status.Text = "AUTO: detected side mismatch"
+        status.Text = "AUTO: source piece is not yours"
+        warn("[Chess Analyzer] Auto move cancelled: source piece side mismatch")
         return
     end
 
     autoMoveBusy = true
-    status.Text = "AUTO: " .. uci:sub(1, 2) .. " → " .. uci:sub(3, 4)
+    status.Text = "AUTO: sending " .. uci:sub(1, 2) .. " → " .. uci:sub(3, 4)
     task.spawn(function()
         local ok, err = pcall(function()
-            clickBoardSquare(uci:sub(1, 2))
-            task.wait(0.12)
-            clickBoardSquare(uci:sub(3, 4))
-            task.wait(0.15)
+            local confirmed = false
 
-            -- This board may request a second tap to confirm the destination.
-            local hint = board:FindFirstChild("ConfirmHint")
-            if hint and hint.Visible then
+            for attempt = 1, 2 do
+                if moveIsOnBoard(uci) then
+                    confirmed = true
+                    break
+                end
+
+                status.Text = "AUTO: click attempt " .. attempt .. "/2"
+                clickBoardSquare(uci:sub(1, 2))
+                task.wait(0.16)
                 clickBoardSquare(uci:sub(3, 4))
+                task.wait(0.25)
+
+                -- Chess Duels sometimes asks for a second tap to confirm.
+                local confirmHint = board:FindFirstChild("ConfirmHint")
+                if confirmHint and confirmHint.Visible then
+                    clickBoardSquare(uci:sub(3, 4))
+                    task.wait(0.25)
+                end
+
+                -- Wait for the source to clear and the destination to fill.
+                local deadline = os.clock() + 1.35
+                repeat
+                    if moveIsOnBoard(uci) then
+                        confirmed = true
+                        break
+                    end
+                    task.wait(0.08)
+                until os.clock() >= deadline
+
+                if confirmed then break end
+            end
+
+            if confirmed then
+                lastFen = nil
+                retryPending = false
+                status.Text = "AUTO: MOVE CONFIRMED"
+            else
+                status.Text = "AUTO: GAME DID NOT ACCEPT CLICK"
+                warn("[Chess Analyzer] Auto move was not reflected on the board: " .. uci)
             end
         end)
-        task.wait(0.65)
+
         autoMoveBusy = false
         if not ok then
-            status.Text = "AUTO CLICK ERROR: " .. tostring(err)
+            status.Text = "AUTO INPUT ERROR: " .. tostring(err)
+            warn("[Chess Analyzer] " .. tostring(err))
         end
     end)
 end
