@@ -23,7 +23,8 @@ local enabled, busy = false, false
 local autoMoveEnabled, autoMoveBusy = false, false
 local nextApiRequestAt = 0
 local retryPending = false
-local boardFlipped = false
+local boardFlipped = false -- vertical orientation (rank 1 at top)
+local boardFlippedX = false -- horizontal orientation (file a at right)
 local playerSide = nil
 local turn = nil
 local lastPlacement, lastFen = nil, nil
@@ -168,23 +169,39 @@ end
 local function detectPlayerSide()
     local squaresGui = board:FindFirstChild("Squares")
     if squaresGui then
+        local fileAPos, fileHPos
         for _, cell in ipairs(squaresGui:GetChildren()) do
             if cell.Name == "Cell" then
                 local rankLabel = cell:FindFirstChild("Rank")
+                local fileLabel = cell:FindFirstChild("File")
+
+                if fileLabel and fileLabel:IsA("TextLabel") then
+                    if fileLabel.Text:lower() == "a" then
+                        fileAPos = cell.AbsolutePosition.X + cell.AbsoluteSize.X / 2
+                    elseif fileLabel.Text:lower() == "h" then
+                        fileHPos = cell.AbsolutePosition.X + cell.AbsoluteSize.X / 2
+                    end
+                end
+
                 if rankLabel and rankLabel:IsA("TextLabel") and rankLabel.Text == "1" then
                     local boardMidY = squaresGui.AbsolutePosition.Y + squaresGui.AbsoluteSize.Y / 2
                     local cellMidY = cell.AbsolutePosition.Y + cell.AbsoluteSize.Y / 2
                     if math.abs(cellMidY - boardMidY) > 5 then
                         boardFlipped = cellMidY < boardMidY
                         playerSide = boardFlipped and "b" or "w"
-                        return playerSide
                     end
                 end
             end
         end
+
+        -- The File labels reveal horizontal mirroring independently of color.
+        if fileAPos and fileHPos and math.abs(fileAPos - fileHPos) > 5 then
+            boardFlippedX = fileAPos > fileHPos
+        end
+        if playerSide then return playerSide end
     end
 
-    -- Fallback: infer which army is physically closest to the bottom edge.
+    -- Fallback if labels are temporarily hidden during the match UI transition.
     local whiteBottom, blackBottom = 0, 0
     for _, obj in ipairs(pieces:GetChildren()) do
         if obj:IsA("ImageLabel") or obj:IsA("ImageButton") then
@@ -212,7 +229,7 @@ local function readBoard()
             if symbol then
                 local screenFile = math.floor(obj.Position.X.Scale * 8 + 0.5)
                 local screenRank = math.floor(obj.Position.Y.Scale * 8 + 0.5)
-                local file = boardFlipped and (7 - screenFile) or screenFile
+                local file = boardFlippedX and (7 - screenFile) or screenFile
                 local rankFromTop = boardFlipped and (7 - screenRank) or screenRank
                 if file >= 0 and file < 8 and rankFromTop >= 0 and rankFromTop < 8 then
                     squares[rankFromTop * 8 + file + 1] = symbol
@@ -385,12 +402,13 @@ attachTurnRemote()
 local function boardPoint(square)
     local file = string.byte(square, 1) - 96
     local rank = tonumber(square:sub(2, 2))
-    if boardFlipped then
-        return (8.5 - file) * pieces.AbsoluteSize.X / 8,
-               (rank - 0.5) * pieces.AbsoluteSize.Y / 8
-    end
-    return (file - 0.5) * pieces.AbsoluteSize.X / 8,
-           (8.5 - rank) * pieces.AbsoluteSize.Y / 8
+    local x = boardFlippedX
+        and (8.5 - file) * pieces.AbsoluteSize.X / 8
+        or (file - 0.5) * pieces.AbsoluteSize.X / 8
+    local y = boardFlipped
+        and (rank - 0.5) * pieces.AbsoluteSize.Y / 8
+        or (8.5 - rank) * pieces.AbsoluteSize.Y / 8
+    return x, y
 end
 
 local function setLine(part, x1, y1, x2, y2, width)
@@ -619,6 +637,7 @@ task.spawn(function()
     -- Detect orientation before the first FEN snapshot.
     detectPlayerSide()
     local previous = readBoard()
+    local pendingPlacement, pendingCount = nil, 0
     lastPlacement = placementFrom(previous)
     local startPlacement = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"
 
@@ -632,7 +651,7 @@ task.spawn(function()
 
     while gui.Parent do
         task.wait(0.25)
-        local oldFlip = boardFlipped
+        local oldFlip, oldFlipX = boardFlipped, boardFlippedX
         local detected = detectPlayerSide()
         if detected then
             playerSideLabel.Text = detected == "w" and "YOU: WHITE (AUTO)" or "YOU: BLACK (AUTO)"
@@ -645,6 +664,7 @@ task.spawn(function()
         local boardReady = true
 
         if placement == startPlacement and lastPlacement ~= startPlacement then
+            pendingPlacement, pendingCount = nil, 0
             castling = {K=true, Q=true, k=true, q=true}
             ep, halfmove, fullmove = "-", 0, 1
             setTurn("w")
@@ -653,7 +673,7 @@ task.spawn(function()
             lastFen = nil
             clearArrow()
         elseif placement ~= lastPlacement then
-            if oldFlip ~= boardFlipped then
+            if oldFlip ~= boardFlipped or oldFlipX ~= boardFlippedX then
                 -- A coordinate remap is not a chess move.
                 previous = current
                 lastPlacement = placement
@@ -666,10 +686,28 @@ task.spawn(function()
                     lastFen = nil
                     clearArrow()
                 else
-                    -- Keep the last complete board snapshot. The next poll can
-                    -- then recognize the full move after Roblox finishes animating.
-                    boardReady = false
-                    status.Text = "Syncing board animation..."
+                    -- Wait for two identical complete snapshots. Some board updates
+                    -- contain intermediate frames that are not a legal single move.
+                    if pendingPlacement == placement then
+                        pendingCount += 1
+                    else
+                        pendingPlacement = placement
+                        pendingCount = 1
+                    end
+
+                    if pendingCount >= 2 then
+                        -- The board is stable but its animation diff was ambiguous.
+                        -- Keep the last known turn instead of freezing analysis forever.
+                        previous = current
+                        lastPlacement = placement
+                        lastFen = nil
+                        pendingPlacement, pendingCount = nil, 0
+                        clearArrow()
+                        status.Text = "Board synced; using current turn"
+                    else
+                        boardReady = false
+                        status.Text = "Syncing board animation..."
+                    end
                 end
             end
         end
