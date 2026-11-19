@@ -22,7 +22,6 @@ local imageToPiece = {
 local enabled, busy = false, false
 local autoMoveEnabled, autoMoveBusy = false, false
 local nextApiRequestAt = 0
-local apiBlockedUntil = 0
 local retryPending = false
 local boardFlipped = false
 local playerSide = nil
@@ -391,80 +390,71 @@ local function autoPlayMove(uci)
     end)
 end
 
+local LOCAL_STOCKFISH_URL = "http://127.0.0.1:8765/analyze"
+local LOCAL_STOCKFISH_DEPTH = 18
+
 local function analyze()
     if busy or not enabled then return end
-
-    local now = os.clock()
-    if now < apiBlockedUntil then
+    if os.clock() < nextApiRequestAt then
         retryPending = true
-        status.Text = "Lichess rate limit: " .. math.ceil(apiBlockedUntil - now) .. "s"
-        return
-    end
-    if now < nextApiRequestAt then
-        retryPending = true
-        status.Text = "Waiting before next API request..."
         return
     end
 
     busy = true
-    nextApiRequestAt = now + 8
-    status.Text = "Status: REQUESTING..."
+    nextApiRequestAt = os.clock() + 1
+    status.Text = "Status: LOCAL STOCKFISH..."
 
     local requestedFen = makeFen(readBoard())
     local ok, result = pcall(function()
-        local url = "https://lichess.org/api/cloud-eval?fen=" .. HttpService:UrlEncode(requestedFen) .. "&multiPv=1&variant=standard"
         local response = request({
-            Url = url,
-            Method = "GET",
-            Headers = { ["Accept"] = "application/json" }
+            Url = LOCAL_STOCKFISH_URL,
+            Method = "POST",
+            Headers = {
+                ["Content-Type"] = "application/json",
+                ["Accept"] = "application/json"
+            },
+            Body = HttpService:JSONEncode({
+                fen = requestedFen,
+                depth = LOCAL_STOCKFISH_DEPTH
+            })
         })
-        local statusCode = tonumber(response.StatusCode)
-        if statusCode == 429 then
-            return { http = 429, fen = requestedFen }
-        elseif statusCode == 404 then
-            return { http = 404, fen = requestedFen }
-        elseif statusCode ~= 200 then
-            return { http = statusCode or -1, fen = requestedFen }
-        end
 
-        local data = HttpService:JSONDecode(response.Body)
-        if not data.pvs or not data.pvs[1] or not data.pvs[1].moves then
-            return { error = "No principal variation returned", fen = requestedFen }
+        local statusCode = tonumber(response.StatusCode)
+        local body = HttpService:JSONDecode(response.Body or "{}")
+        if statusCode ~= 200 then
+            return {
+                error = body.error or ("Local server HTTP " .. tostring(statusCode or "?")),
+                statusCode = statusCode
+            }
         end
-        return { fen = requestedFen, data = data, move = data.pvs[1].moves:sub(1, 4) }
+        if not body.data or not body.data.pvs or not body.data.pvs[1] then
+            return { error = "Local Stockfish returned an invalid response" }
+        end
+        local move = body.move or body.data.bestmove or body.data.pvs[1].moves
+        if type(move) ~= "string" or #move < 4 then
+            return { error = "Stockfish did not return a valid best move" }
+        end
+        return {
+            fen = requestedFen,
+            data = body.data,
+            move = move:sub(1, 4)
+        }
     end)
 
     busy = false
 
     if not ok then
         retryPending = true
-        nextApiRequestAt = math.max(nextApiRequestAt, os.clock() + 15)
-        status.Text = "Network/API error. Retry in 15s"
-        warn("[Chess Analyzer] " .. tostring(result))
+        nextApiRequestAt = os.clock() + 5
+        status.Text = "LOCAL SERVER OFFLINE — run start_server.bat"
+        warn("[Chess Analyzer] Local Stockfish connection failed: " .. tostring(result))
         return
     end
 
-    if result.http == 429 then
-        apiBlockedUntil = os.clock() + 60
-        nextApiRequestAt = apiBlockedUntil
+    if result.error then
         retryPending = true
-        status.Text = "Lichess rate limited: waiting 60s"
-        return
-    elseif result.http == 404 then
-        lastFen = result.fen
-        retryPending = false
-        status.Text = "Position not in Lichess cache (404)"
-        clearArrow()
-        return
-    elseif result.http then
-        retryPending = true
-        nextApiRequestAt = math.max(nextApiRequestAt, os.clock() + 15)
-        status.Text = "Lichess HTTP " .. tostring(result.http) .. " — retry in 15s"
-        return
-    elseif result.error then
-        lastFen = result.fen
-        retryPending = false
-        status.Text = result.error
+        nextApiRequestAt = os.clock() + 5
+        status.Text = tostring(result.error)
         clearArrow()
         return
     end
@@ -472,6 +462,11 @@ local function analyze()
     retryPending = false
     lastFen = result.fen
     local pv = result.data.pvs[1]
+    if result.data.engine then
+        engineLabel.Text = "Engine: " .. tostring(result.data.engine)
+    else
+        engineLabel.Text = "Engine: Local Stockfish"
+    end
     bestLabel.Text = "Best: " .. result.move:sub(1, 2) .. " → " .. result.move:sub(3, 4)
     if pv.mate ~= nil then
         evalLabel.Text = "Evaluation: Mate " .. tostring(pv.mate)
@@ -479,7 +474,7 @@ local function analyze()
         evalLabel.Text = string.format("Evaluation: %+.2f", (pv.cp or 0) / 100)
     end
     depthLabel.Text = "Depth: " .. tostring(result.data.depth or "?")
-    status.Text = "Status: ANALYZED"
+    status.Text = "Status: LOCAL ANALYSIS"
     drawArrow(result.move)
     autoPlayMove(result.move)
 end
@@ -547,10 +542,7 @@ task.spawn(function()
                 clearArrow()
             end
             local fen = makeFen(current)
-            local now = os.clock()
-            if now < apiBlockedUntil then
-                status.Text = "Lichess rate limit: " .. math.ceil(apiBlockedUntil - now) .. "s"
-            elseif (fen ~= lastFen or retryPending) and now >= nextApiRequestAt then
+            if (fen ~= lastFen or retryPending) and os.clock() >= nextApiRequestAt then
                 analyze()
             end
         end
