@@ -1,5 +1,5 @@
 -- Chess Analyzer for Potassium (Roblox)
--- Reads the Chess Duels GUI, queries Lichess Cloud Eval, and draws a best-move arrow.
+-- Reads the Chess Duels GUI, queries the local Stockfish HTTP bridge, and draws the best-move arrow.
 -- Start from a fresh game for reliable castling/en-passant tracking.
 
 local Players = game:GetService("Players")
@@ -304,6 +304,7 @@ local function updateMetadata(previous, current)
         local rank = 8 - math.floor((middle - 1) / 8)
         ep = string.char(97 + file) .. tostring(rank)
     end
+    if #sources > #destinations then captured = true end -- en-passant capture
     if movedPiece:lower() == "p" or captured then halfmove = 0 else halfmove += 1 end
     if movedSide == "b" then fullmove += 1 end
 
@@ -343,7 +344,7 @@ local function findTurnInState(value, depth)
         isblackturn=true, whitetomove=true, blacktomove=true
     }
     for key, child in pairs(value) do
-        local keyName = tostring(key):lower():gsub("[%s%-]", "")
+        local keyName = tostring(key):lower():gsub("[%s%-%_]", "")
         if recognized[keyName] then
             local parsed = normalizeTurn(child, keyName)
             if parsed then return parsed end
@@ -366,7 +367,7 @@ local function attachTurnRemote()
         updateRemote.OnClientEvent:Connect(function(...)
             local args = {...}
             if type(args[1]) == "string" and #args >= 2 then
-                local keyName = args[1]:lower():gsub("[%s%-]", "")
+                local keyName = args[1]:lower():gsub("[%s%-%_]", "")
                 if keyName:find("turn") then
                     local parsed = normalizeTurn(args[2], keyName)
                     if parsed then setTurn(parsed) end
@@ -674,11 +675,15 @@ task.spawn(function()
         end
 
         if enabled and not busy and boardReady then
-            local fen = makeFen(current)
-            if fen and (fen ~= lastFen or retryPending) and os.clock() >= nextApiRequestAt then
-                analyze()
-            elseif not fen then
-                status.Text = "Waiting for turn sync..."
+            if autoMoveEnabled and (not playerSide or turn ~= playerSide) then
+                status.Text = "AUTO: WAITING FOR YOUR TURN"
+            else
+                local fen = makeFen(current)
+                if fen and (fen ~= lastFen or retryPending) and os.clock() >= nextApiRequestAt then
+                    analyze()
+                elseif not fen then
+                    status.Text = "Waiting for turn sync..."
+                end
             end
         end
     end
