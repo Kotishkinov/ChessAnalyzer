@@ -21,6 +21,9 @@ local imageToPiece = {
 
 local enabled, busy = false, false
 local autoMoveEnabled, autoMoveBusy = false, false
+local nextApiRequestAt = 0
+local apiBlockedUntil = 0
+local retryPending = false
 local boardFlipped = false
 local playerSide = nil
 local turn = "w"
@@ -390,38 +393,84 @@ end
 
 local function analyze()
     if busy or not enabled then return end
+
+    local now = os.clock()
+    if now < apiBlockedUntil then
+        retryPending = true
+        status.Text = "Lichess rate limit: " .. math.ceil(apiBlockedUntil - now) .. "s"
+        return
+    end
+    if now < nextApiRequestAt then
+        retryPending = true
+        status.Text = "Waiting before next API request..."
+        return
+    end
+
     busy = true
+    nextApiRequestAt = now + 8
     status.Text = "Status: REQUESTING..."
+
+    local requestedFen = makeFen(readBoard())
     local ok, result = pcall(function()
-        local squares = readBoard()
-        local fen = makeFen(squares)
-        lastFen = fen
-        local url = "https://lichess.org/api/cloud-eval?fen=" .. HttpService:UrlEncode(fen) .. "&multiPv=1"
+        local url = "https://lichess.org/api/cloud-eval?fen=" .. HttpService:UrlEncode(requestedFen) .. "&multiPv=1&variant=standard"
         local response = request({
             Url = url,
             Method = "GET",
             Headers = { ["Accept"] = "application/json" }
         })
-        if response.StatusCode ~= 200 then
-            return { error = "Cloud cache miss / HTTP " .. tostring(response.StatusCode) }
+        local statusCode = tonumber(response.StatusCode)
+        if statusCode == 429 then
+            return { http = 429, fen = requestedFen }
+        elseif statusCode == 404 then
+            return { http = 404, fen = requestedFen }
+        elseif statusCode ~= 200 then
+            return { http = statusCode or -1, fen = requestedFen }
         end
+
         local data = HttpService:JSONDecode(response.Body)
         if not data.pvs or not data.pvs[1] or not data.pvs[1].moves then
-            return { error = "No principal variation returned" }
+            return { error = "No principal variation returned", fen = requestedFen }
         end
-        return { fen = fen, data = data, move = data.pvs[1].moves:sub(1, 4) }
+        return { fen = requestedFen, data = data, move = data.pvs[1].moves:sub(1, 4) }
     end)
+
     busy = false
+
     if not ok then
-        status.Text = "Error: " .. tostring(result)
-        clearArrow()
+        retryPending = true
+        nextApiRequestAt = math.max(nextApiRequestAt, os.clock() + 15)
+        status.Text = "Network/API error. Retry in 15s"
+        warn("[Chess Analyzer] " .. tostring(result))
         return
     end
-    if result.error then
+
+    if result.http == 429 then
+        apiBlockedUntil = os.clock() + 60
+        nextApiRequestAt = apiBlockedUntil
+        retryPending = true
+        status.Text = "Lichess rate limited: waiting 60s"
+        return
+    elseif result.http == 404 then
+        lastFen = result.fen
+        retryPending = false
+        status.Text = "Position not in Lichess cache (404)"
+        clearArrow()
+        return
+    elseif result.http then
+        retryPending = true
+        nextApiRequestAt = math.max(nextApiRequestAt, os.clock() + 15)
+        status.Text = "Lichess HTTP " .. tostring(result.http) .. " — retry in 15s"
+        return
+    elseif result.error then
+        lastFen = result.fen
+        retryPending = false
         status.Text = result.error
         clearArrow()
         return
     end
+
+    retryPending = false
+    lastFen = result.fen
     local pv = result.data.pvs[1]
     bestLabel.Text = "Best: " .. result.move:sub(1, 2) .. " → " .. result.move:sub(3, 4)
     if pv.mate ~= nil then
@@ -432,7 +481,6 @@ local function analyze()
     depthLabel.Text = "Depth: " .. tostring(result.data.depth or "?")
     status.Text = "Status: ANALYZED"
     drawArrow(result.move)
-    lastFen = result.fen
     autoPlayMove(result.move)
 end
 
@@ -499,7 +547,12 @@ task.spawn(function()
                 clearArrow()
             end
             local fen = makeFen(current)
-            if fen ~= lastFen then analyze() end
+            local now = os.clock()
+            if now < apiBlockedUntil then
+                status.Text = "Lichess rate limit: " .. math.ceil(apiBlockedUntil - now) .. "s"
+            elseif (fen ~= lastFen or retryPending) and now >= nextApiRequestAt then
+                analyze()
+            end
         end
     end
 end)
